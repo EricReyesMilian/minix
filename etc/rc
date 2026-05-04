@@ -465,4 +465,6 @@ rc_log_flush()
 # functions.
 #
 rc_real_work "$@" 2>&1 | rc_postprocess
+sleep 3
+mount -t vbfs -o share=SharedMinix none /mnt/shared
 exit $?
