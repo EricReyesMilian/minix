@@ -17,6 +17,10 @@ static unsigned balance_timeout;
 
 #define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
 
+/* CPU-bound process penalty mechanism */
+#define CPU_BOUND_QUANTUM_THRESHOLD 3 /* quantums to trigger penalty */
+#define MAX_PENALTY_LEVEL 2 /* maximum penalty levels */
+
 static int schedule_process(struct schedproc * rmp, unsigned flags);
 
 #define SCHEDULE_CHANGE_PRIO	0x1
@@ -96,6 +100,12 @@ int do_noquantum(message *m_ptr)
 	}
 
 	rmp = &schedproc[proc_nr_n];
+	
+	/* Count full quantum consumed by this process */
+	if (!is_system_proc(rmp)) {
+		rmp->quantum_count++;
+	}
+	
 	if (rmp->priority < MIN_USER_Q) {
 		rmp->priority += 1; /* lower priority */
 	}
@@ -165,6 +175,11 @@ int do_start_scheduling(message *m_ptr)
 		return EINVAL;
 	}
 
+	/* Initialize penalty mechanism fields */
+	rmp->base_priority = USER_Q;
+	rmp->quantum_count = 0;
+	rmp->penalty_level = 0;
+	
 	/* Inherit current priority and time slice from parent. Since there
 	 * is currently only one scheduler scheduling the whole system, this
 	 * value is local and we assert that the parent endpoint is valid */
@@ -193,7 +208,10 @@ int do_start_scheduling(message *m_ptr)
 		 * quanum and priority are set explicitly rather than inherited 
 		 * from the parent */
 		rmp->priority   = rmp->max_priority;
+		rmp->base_priority = rmp->max_priority;
 		rmp->time_slice = m_ptr->m_lsys_sched_scheduling_start.quantum;
+		rmp->quantum_count = 0;
+		rmp->penalty_level = 0;
 		break;
 		
 	case SCHEDULING_INHERIT:
@@ -205,7 +223,10 @@ int do_start_scheduling(message *m_ptr)
 			return rv;
 
 		rmp->priority = schedproc[parent_nr_n].priority;
+		rmp->base_priority = schedproc[parent_nr_n].priority;
 		rmp->time_slice = schedproc[parent_nr_n].time_slice;
+		rmp->quantum_count = 0;
+		rmp->penalty_level = 0;
 		break;
 		
 	default: 
@@ -348,22 +369,125 @@ void init_scheduling(void)
 /* This function in called every N ticks to rebalance the queues. The current
  * scheduler bumps processes down one priority when ever they run out of
  * quantum. This function will find all proccesses that have been bumped down,
- * and pulls them back up. This default policy will soon be changed.
+ * and pulls them back up. 
+ *
+ * Additionally, this function implements CPU-bound process penalty:
+ * - If a process consumed CPU_BOUND_QUANTUM_THRESHOLD full quantums in the
+ *   current window, it gets penalized (priority reduced) up to MAX_PENALTY_LEVEL
+ * - If a process did not consume any full quantums, it can recover gradually
+ *   (priority improved) back to its base priority
  */
 void balance_queues(void)
 {
-	struct schedproc *rmp;
-	int r, proc_nr;
+    struct schedproc *rmp;
+    int r, proc_nr;
+    unsigned new_priority;
 
-	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
-		if (rmp->flags & IN_USE) {
-			if (rmp->priority > rmp->max_priority) {
-				rmp->priority -= 1; /* increase priority */
-				schedule_process_local(rmp);
-			}
-		}
-	}
+    /* Recorrer toda la tabla de procesos administrados por el scheduler */
+    for (proc_nr = 0, rmp = schedproc;
+         proc_nr < NR_PROCS;
+         proc_nr++, rmp++) {
 
-	if ((r = sys_setalarm(balance_timeout, 0)) != OK)
-		panic("sys_setalarm failed: %d", r);
+        /* Procesos normales de usuario */
+        if (rmp->flags & IN_USE && !is_system_proc(rmp)) {
+
+            /* 
+             * Si el proceso agotó demasiados quantums en esta ventana,
+             * se considera CPU-bound y se aplica penalización.
+             */
+            if (rmp->quantum_count >= CPU_BOUND_QUANTUM_THRESHOLD) {
+
+                /* Aumentar nivel de penalización progresivamente */
+                if (rmp->penalty_level < MAX_PENALTY_LEVEL) {
+                    rmp->penalty_level++;
+                }
+
+                /* Calcular nueva prioridad */
+                new_priority =
+                    rmp->base_priority + rmp->penalty_level;
+
+                /* Evitar exceder la peor prioridad permitida */
+                if (new_priority < MIN_USER_Q) {
+                    new_priority = MIN_USER_Q;
+                }
+
+                /* Aplicar cambios solo si la prioridad cambió */
+                if (rmp->priority != new_priority) {
+
+                    rmp->priority = new_priority;
+
+                    schedule_process_local(rmp);
+
+                    /* Mensaje de depuración */
+                    printf(
+                        "SCHED: PENALTY process %d -> "
+                        "level=%u, prio=%u (quantums=%u)\n",
+                        rmp->endpoint,
+                        rmp->penalty_level,
+                        rmp->priority,
+                        rmp->quantum_count
+                    );
+                }
+            }
+
+            /*
+             * Si el proceso no agotó ningún quantum en esta ventana,
+             * se interpreta como comportamiento interactivo o bloqueante,
+             * por lo que se recupera prioridad gradualmente.
+             */
+            else if (rmp->quantum_count == 0 &&
+                     rmp->penalty_level > 0) {
+
+                /* Reducir penalización */
+                rmp->penalty_level--;
+
+                /* Recalcular prioridad */
+                new_priority =
+                    rmp->base_priority + rmp->penalty_level;
+
+                /* No superar la prioridad máxima permitida */
+                if (new_priority > rmp->max_priority) {
+                    new_priority = rmp->max_priority;
+                }
+
+                /* Actualizar únicamente si hubo cambios */
+                if (rmp->priority != new_priority) {
+
+                    rmp->priority = new_priority;
+
+                    schedule_process_local(rmp);
+
+                    /* Mensaje de recuperación */
+                    printf(
+                        "SCHED: RECOVERY process %d -> "
+                        "level=%u, prio=%u\n",
+                        rmp->endpoint,
+                        rmp->penalty_level,
+                        rmp->priority
+                    );
+                }
+            }
+
+            /* Reiniciar contador para la próxima ventana */
+            rmp->quantum_count = 0;
+        }
+
+        /*
+         * Procesos del sistema:
+         * se mantiene el comportamiento tradicional del scheduler.
+         */
+        else if (rmp->flags & IN_USE) {
+
+            if (rmp->priority > rmp->max_priority) {
+
+                rmp->priority -= 1;
+
+                schedule_process_local(rmp);
+            }
+        }
+    }
+
+    /* Reprogramar próxima ejecución del balanceador */
+    if ((r = sys_setalarm(balance_timeout, 0)) != OK)
+        panic("sys_setalarm failed: %d", r);
 }
